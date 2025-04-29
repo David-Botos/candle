@@ -29,6 +29,9 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 criterion = { workspace = true }
 
+[build-dependencies]
+anyhow = { workspace = true }
+
 [features]
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate"]
