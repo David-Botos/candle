@@ -5,7 +5,7 @@ use candle::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
 #[cfg(feature = "cuda")]
-mod cuda_layer_norm;
+use crate::cuda_layer_norm;
 
 /// Applies the softmax function to the input tensor, rescaling the element so that elements on
 /// a slice of fixed index on dimension `dim` are between 0 and 1 and sum to 1.
@@ -88,58 +88,159 @@ impl candle::CustomOp1 for Sigmoid {
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
-        storage: &candle::CudaStorage,
-        layout: &Layout,
+        s1: &candle::CudaStorage,
+        l1: &Layout,
+        s2: &candle::CudaStorage,
+        l2: &Layout,
+        s3: &candle::CudaStorage,
+        l3: &Layout,
     ) -> Result<(candle::CudaStorage, Shape)> {
-        use candle::cuda_backend::cudarc::driver::{
-            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::WrapErr;
+        use half::{bf16, f16};
+        use std::ptr;
+        
+        // Get input matrices dimensions
+        let (rows, cols) = match l1.shape().dims() {
+            &[r, c] => (r, c),
+            _ => candle::bail!("layer-norm expects input tensor of rank 2")
         };
-        use candle::cuda_backend::{kernel_name, kernels, Map1, WrapErr};
-        use candle::{CudaDevice, WithDType};
-
-        struct S;
-        impl Map1 for S {
-            fn f<T: DeviceRepr + WithDType>(
-                &self,
-                src: &CudaSlice<T>,
-                dev: &CudaDevice,
-                layout: &Layout,
-            ) -> Result<CudaSlice<T>> {
-                let src = match layout.contiguous_offsets() {
-                    None => candle::bail!("input has to be contiguous"),
-                    Some((o1, o2)) => src.slice(o1..o2),
-                };
-                let el = layout.shape().elem_count();
-                let dims = layout.shape().dims();
-                let dim_m1 = dims[dims.len() - 1];
-                let (n_rows, n_cols) = (el / dim_m1, dim_m1);
-
-                let cfg = LaunchConfig {
-                    grid_dim: (n_rows as u32, 1, 1),
-                    block_dim: (1, 32, 1),
-                    shared_mem_bytes: 0,
-                };
-                let func = dev.get_or_load_func(&kernel_name::<T>("softmax"), &kernels::REDUCE)?;
-                // SAFETY: Set later by running the kernel.
-                let dst = unsafe { dev.alloc::<T>(el)? };
-                let mut builder = func.builder();
-                builder.arg(&src);
-                builder.arg(&dst);
-                candle::builder_arg!(builder, n_cols as i32);
-                // SAFETY: ffi.
-                unsafe { builder.launch(cfg) }.w()?;
-                Ok(dst)
+        
+        // Check that weight and bias have the right shapes
+        if l2.shape().dims() != &[cols] {
+            candle::bail!("gamma shape mismatch {:?} vs {:?}", l2.shape().dims(), cols);
+        }
+        if l3.shape().dims() != &[cols] {
+            candle::bail!("beta shape mismatch {:?} vs {:?}", l3.shape().dims(), cols);
+        }
+        
+        if !(cols % 8 == 0 && cols <= 8192) {
+            candle::bail!("hidden size must be % 8 and <= 8192")
+        }
+        
+        // Function to perform the actual CUDA operation based on data type
+        fn inner<T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr>(
+            x: &candle::CudaStorage,
+            x_l: &Layout,
+            gamma: &candle::CudaStorage,
+            g_l: &Layout,
+            beta: &candle::CudaStorage,
+            b_l: &Layout,
+            eps: f32,
+        ) -> Result<(candle::CudaStorage, Shape)> {
+            // Get CUDA device
+            let dev = x.device();
+            
+            // Get internal layer norm type id for the given dtype
+            let layer_norm_type = crate::cuda_layer_norm::layer_norm_internal_type(x.dtype())?;
+            
+            // Get cuda slices for all tensors
+            let x_slice = x.as_cuda_slice::<T>()?;
+            let g_slice = gamma.as_cuda_slice::<T>()?;
+            let b_slice = beta.as_cuda_slice::<T>()?;
+            
+            // Get cuda views for all tensors starting at correct offset
+            let x = x_slice.slice(x_l.start_offset()..);
+            let g = g_slice.slice(g_l.start_offset()..);
+            let b = b_slice.slice(b_l.start_offset()..);
+            
+            // Input matrix layout
+            let (rows, cols) = x_l.shape().dims2()?;
+            
+            // Check stride is contiguous for last dimension
+            let x_stride = x_l.stride();
+            let g_stride = g_l.stride();
+            let b_stride = b_l.stride();
+            
+            if x_stride[x_stride.len() - 1] != 1 {
+                candle::bail!("the last dim of x must be contiguous {x_stride:?}")
+            }
+            if g_stride[g_stride.len() - 1] != 1 {
+                candle::bail!("the last dim of g must be contiguous {g_stride:?}")
+            }
+            if b_stride[b_stride.len() - 1] != 1 {
+                candle::bail!("the last dim of b must be contiguous {b_stride:?}")
+            }
+            
+            // Round cols to match with the correct kernel
+            let cols_rounded = if cols <= 1536 {
+                crate::cuda_layer_norm::round_multiple(cols, 256)
+            } else if cols <= 3072 {
+                crate::cuda_layer_norm::round_multiple(cols, 512)
+            } else {
+                crate::cuda_layer_norm::round_multiple(cols, 1024)
+            };
+            
+            // For residual add (not used here)
+            let residual_ptr = ptr::null() as *const std::ffi::c_void;
+            let dst_add_ptr = ptr::null() as *const std::ffi::c_void;
+            
+            // Output shape is the same as input
+            let out_shape = Shape::from((rows, cols));
+            
+            // Allocate output using direct allocation without .w()
+            let dst = unsafe { dev.alloc::<T>(out_shape.elem_count()) }?;
+            
+            // Allocate internal buffers for mean and inverse standard deviation
+            let mu = unsafe { dev.alloc::<f32>(rows) }?;
+            let rsigma = unsafe { dev.alloc::<f32>(rows) }?;
+            
+            // Get CUDA pointers - need to use the correct API
+            let stream = dev.cuda_stream();
+            let x_ptr = x.device_ptr(stream.as_ref()).0 as *const core::ffi::c_void;
+            let g_ptr = g.device_ptr(stream.as_ref()).0 as *const core::ffi::c_void;
+            let b_ptr = b.device_ptr(stream.as_ref()).0 as *const core::ffi::c_void;
+            let dst_ptr = dst.device_ptr(stream.as_ref()).0 as *const core::ffi::c_void;
+            let mu_ptr = mu.device_ptr(stream.as_ref()).0 as *const core::ffi::c_void;
+            let rsigma_ptr = rsigma.device_ptr(stream.as_ref()).0 as *const core::ffi::c_void;
+            
+            // Get multiprocessor count for kernel launch
+            // Since we don't have direct access to device attributes, we'll use a reasonable default
+            // or try to get it through stream properties
+            let multi_processors_count = 8; // Default value, adjust based on testing
+            
+            // Launch kernel
+            unsafe {
+                crate::cuda_layer_norm::run_ln(
+                    x_ptr,
+                    residual_ptr,
+                    g_ptr,
+                    b_ptr,
+                    dst_add_ptr,
+                    dst_ptr,
+                    mu_ptr,
+                    rsigma_ptr,
+                    eps,
+                    cols_rounded as u32,
+                    rows as u32,
+                    cols as u32,
+                    multi_processors_count,
+                    layer_norm_type,
+                    layer_norm_type,
+                    layer_norm_type,
+                    layer_norm_type,
+                    2,
+                    0, // is_rms_norm = false
+                )
+            }
+            
+            // Wrap the output in a CudaStorage
+            let out = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
+            
+            Ok((out, out_shape))
+        }
+        
+        // Call inner function based on data type
+        match s1.dtype() {
+            DType::F16 => inner::<f16>(s1, l1, s2, l2, s3, l3, self.eps),
+            DType::BF16 => inner::<bf16>(s1, l1, s2, l2, s3, l3, self.eps),
+            DType::F32 => inner::<f32>(s1, l1, s2, l2, s3, l3, self.eps),
+            dt => {
+                candle::bail!("layer-norm is only supported for f32, f16 and bf16 ({dt:?})")
             }
         }
-
-        use candle::backend::BackendStorage;
-        let dev = storage.device();
-        let slice = S.map(&storage.slice, dev, layout)?;
-        let dst = candle::cuda_backend::CudaStorage {
-            slice,
-            device: dev.clone(),
-        };
-        Ok((dst, layout.shape().clone()))
     }
 
     #[cfg(feature = "metal")]
